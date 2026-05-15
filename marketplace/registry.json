@@ -1,0 +1,12 @@
+{
+  "plugins": [
+    {
+      "id": "fmcg-pack-01",
+      "name": "FMCG Analytics Pack",
+      "version": "1.0.0",
+      "type": "semantic-pack",
+      "description": "Pre-configured KPIs and dashboards for Retail/FMCG sector.",
+      "metrics": ["inventory_turnover", "shelf_velocity", "out_of_stock_rate"]
+    }
+  ]
+}

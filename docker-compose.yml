@@ -1,0 +1,218 @@
+# QueryBridge Enterprise Orchestration
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+networks:
+  querybridge_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  grafana_data:
+  prometheus_data:
+  loki_data:
+  tempo_data:
+  metadata_volume:
+  backup_volume:
+
+services:
+  # ════════════════════════════════════════
+  # DATA PERSISTENCE LAYER
+  # ════════════════════════════════════════
+  postgres:
+    image: postgres:15-alpine
+    container_name: querybridge_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password123}
+      POSTGRES_DB: querybridge
+    ports:
+      - "5444:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - backup_volume:/backups
+    networks:
+      - querybridge_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d querybridge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+
+  redis:
+    image: redis:7-alpine
+    container_name: querybridge_cache
+    command: redis-server --appendonly yes
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - querybridge_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    container_name: querybridge_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-password123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-querybridge_test}
+      MYSQL_USER: ${MYSQL_USER:-admin}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-password123}
+    ports:
+      - "3307:3306"
+    networks:
+      - querybridge_network
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: querybridge_mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-Password123!}
+      MSSQL_PID: Developer
+    ports:
+      - "1434:1433"
+    networks:
+      - querybridge_network
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -Q \"SELECT 1\" || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+    restart: unless-stopped
+
+  oracle:
+    image: gvenzl/oracle-free:latest
+    container_name: querybridge_oracle
+    environment:
+      ORACLE_PASSWORD: ${ORACLE_PASSWORD:-password123}
+      APP_USER: ${ORACLE_APP_USER:-admin}
+      APP_USER_PASSWORD: ${ORACLE_APP_PASSWORD:-password123}
+    ports:
+      - "1522:1521"
+    networks:
+      - querybridge_network
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh"]
+      interval: 30s
+      timeout: 15s
+      retries: 20
+    restart: unless-stopped
+
+  # ════════════════════════════════════════
+  # CORE API & ORCHESTRATION
+  # ════════════════════════════════════════
+  api:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: querybridge_api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      JWT_SECRET: ${JWT_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      ENV: ${ENV:-production}
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - metadata_volume:/app/data
+      - ./backend:/app
+    networks:
+      - querybridge_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health/"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"
+    restart: unless-stopped
+
+  # ════════════════════════════════════════
+  # FRONTEND & EDGE
+  # ════════════════════════════════════════
+  ui:
+    build: ./frontend
+    container_name: querybridge_ui
+    ports:
+      - "${UI_PORT:-3000}:3000"
+    environment:
+      VITE_API_URL: http://localhost:8000/api/v1
+    depends_on:
+      - api
+    networks:
+      - querybridge_network
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    container_name: querybridge_nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - ui
+      - api
+    networks:
+      - querybridge_network
+    restart: unless-stopped
+
+  # ════════════════════════════════════════
+  # OBSERVABILITY STACK
+  # ════════════════════════════════════════
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: querybridge_prometheus
+    volumes:
+      - ./infra/observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - querybridge_network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: querybridge_grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    networks:
+      - querybridge_network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
